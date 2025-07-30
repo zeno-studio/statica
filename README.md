@@ -1,0 +1,1 @@
+project for static web server use rust
