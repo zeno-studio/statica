@@ -16,7 +16,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::compression::CompressionLayer; // 新增：支持 gzip 压缩
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -25,23 +24,26 @@ use std::io::Cursor;
 use tracing::{info, error, Level};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
-use tracing_appender::rolling; // 新增：日志轮转
+use tracing_appender::rolling;
 use serde::{Serialize, Deserialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use brotli::CompressorWriter;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use sysinfo::System; // Added for memory logging
 
-
-// 定义应用状态
+// Define application state
 #[derive(Debug, Clone)]
 struct AppState {
-    files: Arc<ArcSwap<HashMap<String, (Vec<u8>, String)>>>,
+    files: Arc<ArcSwap<HashMap<String, (Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>)>>>,
     last_updated: Arc<Mutex<i64>>,
     update_log: Arc<Mutex<Vec<UpdateLogEntry>>>,
     api_key: String,
     index_visits: Arc<Mutex<u64>>,
     total_visits: Arc<Mutex<u64>>,
     last_reset: Arc<Mutex<DateTime<Local>>>,
-    stats_file: Arc<Mutex<File>>, // 持久化统计文件
+    stats_file: Arc<Mutex<File>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +63,6 @@ struct VisitStats {
 
 impl AppState {
     fn new(api_key: String) -> Self {
-        // 初始化统计文件
         let stats_file = OpenOptions::new()
             .append(true)
             .create(true)
@@ -95,8 +96,7 @@ impl IntoResponse for AppError {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Error: {:?}", self.0),
-        )
-            .into_response()
+        ).into_response()
     }
 }
 
@@ -113,8 +113,7 @@ async fn fetch_zip(client: &Client, cid: &str) -> Result<Vec<u8>, anyhow::Error>
         Err(anyhow::anyhow!("Failed to fetch ZIP from Arweave: {}", response.status()))
     }
 }
-
-fn extract_zip(zip_data: &[u8]) -> Result<HashMap<String, (Vec<u8>, String)>, anyhow::Error> {
+fn extract_zip(zip_data: &[u8]) -> Result<HashMap<String, (Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>)>, anyhow::Error> {
     info!(size = zip_data.len(), "Extracting ZIP file");
     let cursor = Cursor::new(zip_data);
     let mut archive = ZipArchive::new(cursor)?;
@@ -136,8 +135,29 @@ fn extract_zip(zip_data: &[u8]) -> Result<HashMap<String, (Vec<u8>, String)>, an
                 Some("ico") => "image/x-icon",
                 _ => "application/octet-stream",
             }.to_string();
-            files.insert(path.clone(), (content, mime));
-            info!(path = %path, "Extracted file");
+
+            let brotli_content = {
+                let mut compressed = Vec::new();
+                {
+                    let mut writer = CompressorWriter::new(&mut compressed, 4096, 4, 22);
+                    writer.write_all(&content)?;
+                    writer.flush()?;
+                } // writer is dropped here
+                Some(compressed)
+            };
+
+            let gzip_content = {
+                let mut compressed = Vec::new();
+                {
+                    let mut writer = GzEncoder::new(&mut compressed, Compression::default());
+                    writer.write_all(&content)?;
+                    writer.finish()?;
+                } // writer is dropped here
+                Some(compressed)
+            };
+
+            files.insert(path.clone(), (content, mime, brotli_content, gzip_content));
+            info!(path = %path, "Extracted and pre-compressed file");
         }
     }
     info!(file_count = files.len(), "Extracted files from ZIP");
@@ -147,12 +167,11 @@ fn extract_zip(zip_data: &[u8]) -> Result<HashMap<String, (Vec<u8>, String)>, an
 #[derive(Deserialize)]
 struct UpdateRequest {
     cid: String,
-}   
+}
 
-// API Key 验证中间件
 async fn api_key_middleware(
     State(state): State<AppState>,
-    request: Request<axum::body::Body>,
+    request: Request<Body>,
     next: middleware::Next,
 ) -> impl IntoResponse {
     let header_api_key = request.headers().get("X-API-Key").and_then(|v| v.to_str().ok());
@@ -165,7 +184,7 @@ async fn api_key_middleware(
             error!("Invalid or missing API Key");
             Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
-                .body(axum::body::Body::from("Invalid or missing API Key"))
+                .body(Body::from("Invalid or missing API Key"))
                 .unwrap()
         }
     }
@@ -177,18 +196,22 @@ async fn update_files(
 ) -> Result<impl IntoResponse, AppError> {
     let start_time = std::time::Instant::now();
     let client = Client::builder()
-    .use_rustls_tls()
-    .build()
-    .map_err(|e| {
-        error!("Failed to create HTTP client: {}", e);
-        AppError(anyhow::anyhow!("Failed to create HTTP client: {}", e))
-    })?;
-info!("Built reqwest client with rustls TLS");
+        .use_rustls_tls()
+        .build()
+        .map_err(|e| {
+            error!("Failed to create HTTP client: {}", e);
+            AppError(anyhow::anyhow!("Failed to create HTTP client: {}", e))
+        })?;
+    info!("Built reqwest client with rustls TLS");
     let cid = payload.cid;
     let max_attempts = 15;
-    let mut last_error = None;
 
-    info!(cid = %cid, "Starting update");
+    // Initialize sysinfo for memory tracking
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let before_mem = system.used_memory();
+
+    info!(cid = %cid, before_mem_kb = before_mem, "Starting update");
     let mut log = state.update_log.lock().await;
     log.push(UpdateLogEntry {
         timestamp: Utc::now(),
@@ -205,12 +228,34 @@ info!("Built reqwest client with rustls TLS");
                 match extract_zip(&zip_data) {
                     Ok(new_files) => {
                         if !new_files.contains_key("index.html") {
-                            last_error = Some("New files missing index.html".to_string());
-                            error!("Update failed: missing index.html");
-                            continue;
+                            let error_msg = "New files missing index.html".to_string();
+                            error!("Update failed: {}", error_msg);
+                            let mut log = state.update_log.lock().await;
+                            log.push(UpdateLogEntry {
+                                timestamp: Utc::now(),
+                                cid: cid.clone(),
+                                success: false,
+                                message: error_msg.clone(),
+                            });
+                            if attempt < max_attempts {
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                continue;
+                            }
+                            return Err(AppError(anyhow::anyhow!(error_msg)));
                         }
 
+                        // Log memory before storing new files
+                        system.refresh_memory();
+                        let pre_store_mem = system.used_memory();
+
+                        // Atomically replace old files
                         state.files.store(Arc::new(new_files));
+
+                        // Log memory after storing and wait briefly for GC
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        system.refresh_memory();
+                        let after_mem = system.used_memory();
+
                         let mut last_updated = state.last_updated.lock().await;
                         *last_updated = Utc::now().timestamp();
 
@@ -219,20 +264,44 @@ info!("Built reqwest client with rustls TLS");
                             timestamp: Utc::now(),
                             cid: cid.clone(),
                             success: true,
-                            message: format!("Files updated successfully in {:.2}s", start_time.elapsed().as_secs_f64()),
+                            message: format!(
+                                "Files updated successfully in {:.2}s, memory: {} KB -> {} KB -> {} KB",
+                                start_time.elapsed().as_secs_f64(),
+                                before_mem,
+                                pre_store_mem,
+                                after_mem
+                            ),
                         });
-                        info!(duration = start_time.elapsed().as_secs_f64(), "Update completed");
+                        info!(
+                            duration = start_time.elapsed().as_secs_f64(),
+                            before_mem_kb = before_mem,
+                            pre_store_mem_kb = pre_store_mem,
+                            after_mem_kb = after_mem,
+                            "Update completed"
+                        );
                         return Ok((StatusCode::OK, "Files updated successfully"));
                     }
                     Err(e) => {
-                        last_error = Some(format!("Failed to extract ZIP: {}", e));
                         error!(error = %e, "Failed to extract ZIP");
+                        let mut log = state.update_log.lock().await;
+                        log.push(UpdateLogEntry {
+                            timestamp: Utc::now(),
+                            cid: cid.clone(),
+                            success: false,
+                            message: format!("Failed to extract ZIP: {}", e),
+                        });
                     }
                 }
             }
             Err(e) => {
-                last_error = Some(format!("Failed to fetch ZIP: {}", e));
                 error!(error = %e, "Failed to fetch ZIP");
+                let mut log = state.update_log.lock().await;
+                log.push(UpdateLogEntry {
+                    timestamp: Utc::now(),
+                    cid: cid.clone(),
+                    success: false,
+                    message: format!("Failed to fetch ZIP: {}", e),
+                });
             }
         }
 
@@ -240,15 +309,6 @@ info!("Built reqwest client with rustls TLS");
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     }
-
-    let mut log = state.update_log.lock().await;
-    log.push(UpdateLogEntry {
-        timestamp: Utc::now(),
-        cid,
-        success: false,
-        message: last_error.unwrap_or("Unknown error".to_string()),
-    });
-    error!(attempts = max_attempts, "Update failed");
 
     Err(AppError(anyhow::anyhow!("Failed to update files after {} attempts", max_attempts)))
 }
@@ -260,7 +320,6 @@ async fn get_update_log(State(state): State<AppState>) -> impl IntoResponse {
     let last_reset = *state.last_reset.lock().await;
     info!(entry_count = log.len(), index_visits = index_visits, total_visits = total_visits, "Serving update log");
 
-    // 持久化当天统计数据
     let stats = VisitStats {
         date: last_reset.date_naive(),
         index_visits,
@@ -289,23 +348,18 @@ async fn get_update_log(State(state): State<AppState>) -> impl IntoResponse {
 async fn serve_file(
     axum::extract::Path(path): axum::extract::Path<String>,
     State(state): State<AppState>,
-    _request: axum::http::Request<axum::body::Body>,
+    request: Request<Body>,
 ) -> impl IntoResponse {
-    // 增加总访问计数
     let mut total_visits = state.total_visits.lock().await;
     *total_visits += 1;
-
-    // 如果是 index.html，增加 index 访问计数
     if path == "index.html" {
         let mut index_visits = state.index_visits.lock().await;
         *index_visits += 1;
     }
 
-    // 检查是否需要重置计数
     let mut last_reset = state.last_reset.lock().await;
     let now = Local::now();
     if now.date_naive() != last_reset.date_naive() {
-        // 持久化前一天的统计数据
         let stats = VisitStats {
             date: last_reset.date_naive(),
             index_visits: *state.index_visits.lock().await,
@@ -323,7 +377,6 @@ async fn serve_file(
             error!(error = %e, "Failed to flush visit stats");
         });
 
-        // 重置计数
         *state.index_visits.lock().await = 0;
         *state.total_visits.lock().await = 0;
         *last_reset = now;
@@ -331,20 +384,39 @@ async fn serve_file(
     }
 
     let files = state.files.load();
+    let accept_encoding = request.headers().get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok());
     match files.get(&path) {
-        Some((content, mime)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, mime.as_str())
-            .body(axum::body::Body::from(content.clone()))
-            .unwrap(),
+        Some((content, mime, brotli_content, gzip_content)) => {
+            if let Some(accept) = accept_encoding {
+                if accept.contains("br") && brotli_content.is_some() {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, mime.as_str())
+                        .header(header::CONTENT_ENCODING, "br")
+                        .body(Body::from(brotli_content.clone().unwrap()))
+                        .unwrap();
+                } else if accept.contains("gzip") && gzip_content.is_some() {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, mime.as_str())
+                        .header(header::CONTENT_ENCODING, "gzip")
+                        .body(Body::from(gzip_content.clone().unwrap()))
+                        .unwrap();
+                }
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_str())
+                .body(Body::from(content.clone()))
+                .unwrap()
+        }
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(axum::body::Body::from("File not found"))
+            .body(Body::from("File not found"))
             .unwrap(),
     }
 }
 
-// 健康检查路由
 async fn health_check() -> impl IntoResponse {
     info!("Health check requested");
     Json(serde_json::json!({
@@ -353,9 +425,23 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
+async fn redirect_to_https(req: Request<Body>, next: middleware::Next) -> impl IntoResponse {
+    if req.uri().scheme() == Some(&http::uri::Scheme::HTTP) {
+        let mut uri_parts = req.uri().clone().into_parts();
+        uri_parts.scheme = Some(http::uri::Scheme::HTTPS);
+        uri_parts.authority = Some(http::uri::Authority::from_static("localhost:8443")); // Replace with your domain
+        let redirect_uri = http::Uri::from_parts(uri_parts).unwrap();
+        return Response::builder()
+            .status(StatusCode::PERMANENT_REDIRECT)
+            .header(header::LOCATION, redirect_uri.to_string())
+            .body(Body::empty())
+            .unwrap();
+    }
+    next.run(req).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 初始化 tracing，输出 JSON 格式日志，带轮转
     let file_writer = rolling::daily("/var/log", "axum.log");
     tracing_subscriber::registry()
         .with(fmt::layer()
@@ -380,25 +466,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/*path", get(serve_file))
         .route("/update", post(update_files).layer(middleware::from_fn_with_state(state.clone(), api_key_middleware)))
         .route("/update_log", get(get_update_log))
-        .route("/health", get(health_check)) // 新增健康检查路由
+        .route("/health", get(health_check))
+        .layer(middleware::from_fn(redirect_to_https)) // Added HTTP-to-HTTPS redirect
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=3600"),
         ))
-        .layer(CompressionLayer::new()) // 新增 gzip 压缩
         .with_state(state);
 
     let cert_path_str = env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());
     let key_path_str = env::var("TLS_KEY_PATH").unwrap_or("./key.pem".to_string());
-
     let cert_path = Path::new(&cert_path_str);
     let key_path = Path::new(&key_path_str);
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8443));  
 
     if cert_path.is_file() && key_path.is_file() {
         match RustlsConfig::from_pem_file(cert_path, key_path).await {
             Ok(tls_config) => {
                 info!("Starting HTTPS server on 0.0.0.0:8443");
-                axum_server::bind_rustls("0.0.0.0:8443".parse().unwrap(), tls_config)
+                axum_server::bind_rustls(addr, tls_config)
                     .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await?;
             }
